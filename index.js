@@ -113,6 +113,8 @@ function publicUser(row, farmName) {
         farm_id: row.farm_id,
         barn_id: row.barn_id,
         floor_id: row.floor_id,
+        email: row.email || null,
+        phone_number: row.phone_number || null,
         farm_name: farmName || 'Farm',
         is_super_admin: row.is_super_admin || false
     };
@@ -274,6 +276,29 @@ function calcDwpDose(product, estimatedWaterLiters) {
 }
 
 // ============================================================
+// TENANT ISOLATION GUARDS
+// ============================================================
+// Setiap endpoint yang terima floorId/barnId dari body request WAJIB
+// pakai salah satu fungsi ini sebelum baca/tulis data — tanpa ini,
+// Manager Client A yang tahu/menebak UUID floor Client B bisa
+// baca/tulis data Client B (IDOR). farmId HARUS dari req.user.farm_id
+// (hasil verifikasi token JWT), TIDAK BOLEH dari input klien.
+async function verifyFloorOwnership(floorId, farmId) {
+    if (!floorId) return false;
+    const r = await pool.query(
+        'SELECT b.farm_id FROM floors f JOIN barns b ON f.barn_id = b.id WHERE f.id = $1',
+        [floorId]
+    );
+    return r.rows.length > 0 && r.rows[0].farm_id === farmId;
+}
+
+async function verifyBarnOwnership(barnId, farmId) {
+    if (!barnId) return false;
+    const r = await pool.query('SELECT farm_id FROM barns WHERE id = $1', [barnId]);
+    return r.rows.length > 0 && r.rows[0].farm_id === farmId;
+}
+
+// ============================================================
 // AUTH MIDDLEWARE
 // ============================================================
 async function auth(req, res, next) {
@@ -304,6 +329,11 @@ function requireManager(req, res, next) {
     return res.status(403).json({ error: 'Akses khusus Manager' });
 }
 
+function requireSuperAdmin(req, res, next) {
+    if (req.isSuperAdmin) return next();
+    return res.status(403).json({ error: 'Akses khusus Super Admin' });
+}
+
 // ============================================================
 // ROUTES: HEALTH / MISC
 // ============================================================
@@ -329,12 +359,36 @@ app.get('/test-db', async (req, res) => {
 // ============================================================
 // AUTH
 // ============================================================
+// ============================================================
+// CLIENT RESOLVE (langkah 1 login — identifikasi tenant SEBELUM
+// daftar nama user dimuat, aman diekspos publik karena cuma
+// mengembalikan nama farm, bukan data user)
+// ============================================================
+app.get('/api/clients/resolve', async (req, res) => {
+    try {
+        const { code } = req.query;
+        if (!code) return res.status(400).json({ error: 'Kode client wajib diisi' });
+        const result = await pool.query(
+            'SELECT id, name FROM farms WHERE client_code = $1',
+            [code.toUpperCase().trim()]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Kode client tidak ditemukan' });
+        res.json({ farm_id: result.rows[0].id, farm_name: result.rows[0].name });
+    } catch (err) {
+        console.error('client resolve error:', err);
+        res.status(500).json({ error: 'Gagal memverifikasi kode client' });
+    }
+});
+
 app.get('/api/users/public', async (req, res) => {
     try {
-        const { role } = req.query;
-        let query = 'SELECT id, name, role FROM users WHERE active = true';
-        const params = [];
-        if (role) { query += ' AND LOWER(role) = LOWER($1)'; params.push(role); }
+        const { role, farmId } = req.query;
+        // WAJIB farmId — tanpa ini daftar nama user akan bocor lintas-client
+        // (siapa pun bisa lihat nama SEMUA client sekaligus di layar login).
+        if (!farmId) return res.status(400).json({ error: 'farmId wajib diisi' });
+        let query = 'SELECT id, name, role FROM users WHERE active = true AND farm_id = $1';
+        const params = [farmId];
+        if (role) { query += ' AND LOWER(role) = LOWER($2)'; params.push(role); }
         query += ' ORDER BY name';
         const result = await pool.query(query, params);
         res.json(result.rows);
@@ -346,8 +400,9 @@ app.get('/api/users/public', async (req, res) => {
 
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
     try {
-        const { userId, pin } = req.body;
+        const { userId, pin, farmId } = req.body;
         if (!userId || !pin) return res.status(400).json({ error: 'User ID dan PIN wajib' });
+        if (!farmId) return res.status(400).json({ error: 'Sesi client tidak valid, muat ulang halaman login' });
         if (!userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
             return res.status(400).json({ error: 'Format User ID tidak valid' });
         }
@@ -356,6 +411,14 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
         const result = await pool.query('SELECT * FROM users WHERE id = $1 AND active = true', [userId]);
         if (result.rows.length === 0) return res.status(401).json({ error: 'User tidak ditemukan' });
         const user = result.rows[0];
+
+        // Pertahanan berlapis: meski frontend sudah scope dropdown per-farm,
+        // tolak juga di backend kalau userId yang dikirim (mis. lewat request
+        // manual/curl) ternyata bukan milik farm yang sedang login.
+        if (user.farm_id !== farmId) {
+            return res.status(401).json({ error: 'User tidak terdaftar di client ini' });
+        }
+
         const valid = await bcrypt.compare(pin, user.pin_hash);
         if (!valid) return res.status(401).json({ error: 'PIN salah' });
 
@@ -397,6 +460,87 @@ app.post('/api/admin/setup', async (req, res) => {
     } catch (err) {
         console.error('Admin setup error:', err);
         res.status(500).json({ error: 'Gagal membuat super admin', detail: err.message });
+    }
+});
+
+// ============================================================
+// ONBOARDING CLIENT BARU (Super Admin only)
+// ============================================================
+// /api/admin/setup di atas hanya untuk 1x pembuatan Super Admin
+// platform. Endpoint ini untuk HEMITA (Super Admin) mendaftarkan
+// client/pelanggan BARU: bikin farm + client_code + Manager
+// pertamanya sekaligus dalam 1 transaksi, tanpa perlu sentuh SQL.
+app.post('/api/admin/create-client', auth, requireSuperAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { farmName, clientCode, ownerName, managerName, managerPin, managerEmail, managerPhone } = req.body;
+        if (!farmName || !clientCode || !managerName || !managerPin) {
+            client.release();
+            return res.status(400).json({ error: 'farmName, clientCode, managerName, dan managerPin wajib diisi' });
+        }
+        const code = clientCode.toUpperCase().trim();
+        if (!code.match(/^[A-Z0-9]{3,30}$/)) {
+            client.release();
+            return res.status(400).json({ error: 'Kode client hanya boleh huruf besar/angka, 3-30 karakter' });
+        }
+        if (!managerPin.match(/^[0-9]{4,6}$/)) {
+            client.release();
+            return res.status(400).json({ error: 'PIN Manager harus 4-6 digit angka' });
+        }
+        if (managerEmail && !managerEmail.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+            client.release();
+            return res.status(400).json({ error: 'Format email tidak valid' });
+        }
+        if (managerPhone && !managerPhone.match(/^(\+62|62|0)8[0-9]{7,12}$/)) {
+            client.release();
+            return res.status(400).json({ error: 'Format nomor telepon tidak valid' });
+        }
+
+        await client.query('BEGIN');
+        const farmRes = await client.query(
+            'INSERT INTO farms (name, owner_name, client_code) VALUES ($1, $2, $3) RETURNING id, name, client_code',
+            [farmName, ownerName || managerName, code]
+        );
+        const farm = farmRes.rows[0];
+
+        const hash = await bcrypt.hash(managerPin, 10);
+        const managerRes = await client.query(`
+            INSERT INTO users (name, pin_hash, role, farm_id, email, phone_number)
+            VALUES ($1, $2, 'manager', $3, $4, $5)
+            RETURNING id, name, role, email, phone_number
+        `, [managerName, hash, farm.id, managerEmail || null, managerPhone || null]);
+
+        await client.query('COMMIT');
+        res.status(201).json({
+            farm,
+            manager: { ...managerRes.rows[0], role: capRole(managerRes.rows[0].role) }
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'Kode client sudah dipakai, pilih kode lain' });
+        }
+        console.error('create-client error:', err);
+        res.status(500).json({ error: 'Gagal membuat client baru', detail: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// Daftar semua client yang terdaftar (untuk dashboard Super Admin)
+app.get('/api/admin/clients', auth, requireSuperAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT f.id, f.name, f.client_code, f.created_at,
+                (SELECT COUNT(*) FROM users u WHERE u.farm_id = f.id AND u.active = true) AS total_users,
+                (SELECT COUNT(*) FROM barns b WHERE b.farm_id = f.id) AS total_kandang
+            FROM farms f
+            ORDER BY f.created_at DESC
+        `);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('list clients error:', err);
+        res.status(500).json({ error: 'Gagal mengambil daftar client' });
     }
 });
 
@@ -456,7 +600,7 @@ app.get('/api/barns', auth, async (req, res) => {
             LEFT JOIN floors f ON f.barn_id = b.id
             WHERE b.farm_id = $1
             GROUP BY b.id
-            ORDER BY b.name
+            ORDER BY b.code NULLS LAST, b.name
         `, [req.user.farm_id]);
         res.json(result.rows);
     } catch (err) {
@@ -465,11 +609,80 @@ app.get('/api/barns', auth, async (req, res) => {
     }
 });
 
+app.post('/api/barns', auth, requireManager, async (req, res) => {
+    try {
+        const { name, code, rt, rw, dusun, desaKelurahan, kecamatan, kotaKabupaten, provinsi, kodePos, floorCount } = req.body;
+        if (!name) return res.status(400).json({ error: 'Nama kandang wajib diisi' });
+
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const barnRes = await client.query(`
+                INSERT INTO barns (farm_id, name, code, rt, rw, dusun, desa_kelurahan, kecamatan, kota_kabupaten, provinsi, kode_pos)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *
+            `, [req.user.farm_id, name, code || null, rt || null, rw || null, dusun || null,
+                desaKelurahan || null, kecamatan || null, kotaKabupaten || null, provinsi || null, kodePos || null]);
+
+            const barn = barnRes.rows[0];
+            const nFloors = Math.min(5, Math.max(1, parseInt(floorCount) || 3)); // maks 5 lantai/kandang
+            for (let i = 1; i <= nFloors; i++) {
+                await client.query(
+                    'INSERT INTO floors (barn_id, name, floor_number, default_population, default_density) VALUES ($1,$2,$3,$4,$5)',
+                    [barn.id, `Lantai ${i}`, i, 20000, 12]
+                );
+            }
+            await client.query('COMMIT');
+            res.status(201).json(barn);
+        } catch (e) {
+            await client.query('ROLLBACK');
+            throw e;
+        } finally {
+            client.release();
+        }
+    } catch (err) {
+        if (err.code === '23505') return res.status(409).json({ error: 'Kode kandang sudah dipakai' });
+        console.error('barn create error:', err);
+        res.status(500).json({ error: 'Gagal membuat kandang', detail: err.message });
+    }
+});
+
+app.put('/api/barns/:id', auth, requireManager, async (req, res) => {
+    try {
+        const { name, rt, rw, dusun, desaKelurahan, kecamatan, kotaKabupaten, provinsi, kodePos } = req.body;
+        // Pakai COALESCE utk SETIAP kolom (bukan cuma 'name') supaya partial
+        // update (mis. cuma kirim {rt, rw}) tidak menimpa field lain jadi NULL.
+        const result = await pool.query(`
+            UPDATE barns SET
+                name = COALESCE($1, name),
+                rt = COALESCE($2, rt),
+                rw = COALESCE($3, rw),
+                dusun = COALESCE($4, dusun),
+                desa_kelurahan = COALESCE($5, desa_kelurahan),
+                kecamatan = COALESCE($6, kecamatan),
+                kota_kabupaten = COALESCE($7, kota_kabupaten),
+                provinsi = COALESCE($8, provinsi),
+                kode_pos = COALESCE($9, kode_pos),
+                updated_at = NOW()
+            WHERE id = $10 AND farm_id = $11
+            RETURNING *
+        `, [name || null, rt || null, rw || null, dusun || null, desaKelurahan || null,
+            kecamatan || null, kotaKabupaten || null, provinsi || null, kodePos || null,
+            req.params.id, req.user.farm_id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Kandang tidak ditemukan' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('barn update error:', err);
+        res.status(500).json({ error: 'Gagal memperbarui data kandang', detail: err.message });
+    }
+});
+
 // ============================================================
 // FLOOR CONFIG
 // ============================================================
 app.get('/api/floors/:id/config', auth, async (req, res) => {
     try {
+        const owns = await verifyFloorOwnership(req.params.id, req.user.farm_id);
+        if (!owns) return res.status(403).json({ error: 'Lantai tidak ditemukan atau bukan milik client ini' });
         const result = await pool.query('SELECT * FROM floor_configs WHERE floor_id = $1', [req.params.id]);
         if (result.rows.length === 0) {
             return res.json({
@@ -495,6 +708,8 @@ app.get('/api/floors/:id/config', auth, async (req, res) => {
 app.post('/api/floors/:id/config', auth, requireManager, async (req, res) => {
     try {
         const floorId = req.params.id;
+        const owns = await verifyFloorOwnership(floorId, req.user.farm_id);
+        if (!owns) return res.status(403).json({ error: 'Lantai tidak ditemukan atau bukan milik client ini' });
         const { elevation_meters, roof_type, nipple_flow_rate_ml_min, water_pressure_psi, meta_data } = req.body;
         const result = await pool.query(`
             INSERT INTO floor_configs (floor_id, elevation_meters, roof_type, nipple_flow_rate_ml_min, water_pressure_psi, meta_data, updated_at)
@@ -524,6 +739,8 @@ app.post('/api/water/predict', auth, async (req, res) => {
         if (!floorId || !ageDays || !population) {
             return res.status(400).json({ error: 'floorId, ageDays, population wajib diisi' });
         }
+        const owns = await verifyFloorOwnership(floorId, req.user.farm_id);
+        if (!owns) return res.status(403).json({ error: 'Lantai tidak ditemukan atau bukan milik client ini' });
         const prediction = await predictWater(floorId, ageDays, temperature, humidity, windSpeed, population);
         res.json(prediction);
     } catch (err) {
@@ -540,6 +757,8 @@ app.post('/api/floor/status', auth, async (req, res) => {
         const { floorId, ageDays, populationStart, mortalityToday, culledToday, soldToday,
             avgWeightKg, fcr, notes, causeCategory } = req.body;
         if (!floorId) return res.status(400).json({ error: 'floorId wajib diisi' });
+        const owns = await verifyFloorOwnership(floorId, req.user.farm_id);
+        if (!owns) return res.status(403).json({ error: 'Lantai tidak ditemukan atau bukan milik client ini' });
 
         const popEnd = Math.max(0, (populationStart || 0) - (mortalityToday || 0) - (culledToday || 0) - (soldToday || 0));
         const totalWeightKg = Math.round(popEnd * (avgWeightKg || 0) * 100) / 100;
@@ -576,13 +795,20 @@ app.post('/api/floor/status', auth, async (req, res) => {
 // ============================================================
 // TELEMETRY
 // ============================================================
-async function insertTelemetry(payload, userId) {
+async function insertTelemetry(payload, userId, farmId) {
     const { barnId, floorId, ageDays, temperature, humidity, mortality, windSpeed,
         waterConsumption, feedConsumption, population } = payload;
 
-    const floorRes = await pool.query('SELECT b.farm_id FROM floors f JOIN barns b ON f.barn_id = b.id WHERE f.id = $1', [floorId]);
-    if (floorRes.rows.length === 0) throw new Error('Floor tidak ditemukan');
-    const farmId = floorRes.rows[0].farm_id;
+    // Verifikasi floor & barn benar milik farm si pemanggil — TANPA ini,
+    // user Client A bisa injeksi telemetri palsu ke floor Client B kalau
+    // tahu/menebak UUID-nya (data akan tersimpan di bawah farm_id yang
+    // salah kalau farmId diambil dari hasil join floor, bukan dari token).
+    const ownsFloor = await verifyFloorOwnership(floorId, farmId);
+    if (!ownsFloor) throw new Error('Lantai tidak ditemukan atau bukan milik client ini');
+    if (barnId) {
+        const ownsBarn = await verifyBarnOwnership(barnId, farmId);
+        if (!ownsBarn) throw new Error('Kandang tidak ditemukan atau bukan milik client ini');
+    }
 
     const thi = calculateTHI(temperature, humidity);
     const zone = getZone(ageDays, thi);
@@ -608,11 +834,12 @@ async function insertTelemetry(payload, userId) {
 
 app.post('/api/telemetry', auth, async (req, res) => {
     try {
-        const row = await insertTelemetry(req.body, req.user.id);
+        const row = await insertTelemetry(req.body, req.user.id, req.user.farm_id);
         res.status(201).json(row);
     } catch (err) {
         console.error('telemetry error:', err);
-        res.status(500).json({ error: 'Gagal menyimpan telemetri', detail: err.message });
+        res.status(err.message.includes('bukan milik client') ? 403 : 500)
+           .json({ error: err.message.includes('bukan milik client') ? err.message : 'Gagal menyimpan telemetri', detail: err.message });
     }
 });
 
@@ -645,9 +872,11 @@ app.post('/api/sync', auth, async (req, res) => {
     for (const item of queue) {
         try {
             if (item.table === 'telemetry_reports') {
-                await insertTelemetry(item.payload, req.user.id);
+                await insertTelemetry(item.payload, req.user.id, req.user.farm_id);
             } else if (item.table === 'floor_daily_status') {
                 const p = item.payload;
+                const owns = await verifyFloorOwnership(p.floorId, req.user.farm_id);
+                if (!owns) throw new Error('Lantai tidak ditemukan atau bukan milik client ini');
                 const popEnd = Math.max(0, (p.populationStart || 0) - (p.mortalityToday || 0) - (p.culledToday || 0) - (p.soldToday || 0));
                 const totalWeightKg = Math.round(popEnd * (p.avgWeightKg || 0) * 100) / 100;
                 await pool.query(`
@@ -683,6 +912,8 @@ app.post('/api/dwp/calculate', auth, async (req, res) => {
     try {
         const { floorId, ageDays, totalBirds, estimatedWaterLiters } = req.body;
         if (!floorId || !totalBirds) return res.status(400).json({ error: 'floorId dan totalBirds wajib diisi' });
+        const owns = await verifyFloorOwnership(floorId, req.user.farm_id);
+        if (!owns) return res.status(403).json({ error: 'Lantai tidak ditemukan atau bukan milik client ini' });
 
         let waterLiters = estimatedWaterLiters;
         if (!waterLiters) {
@@ -710,6 +941,8 @@ app.post('/api/dwp/order', auth, requireManager, async (req, res) => {
     try {
         const { floorId, ageDays, totalBirds } = req.body;
         if (!floorId || !totalBirds) return res.status(400).json({ error: 'floorId dan totalBirds wajib diisi' });
+        const owns = await verifyFloorOwnership(floorId, req.user.farm_id);
+        if (!owns) return res.status(403).json({ error: 'Lantai tidak ditemukan atau bukan milik client ini' });
 
         const pred = await predictWater(floorId, ageDays, 28, 70, 2, totalBirds);
         const zone = getZone(ageDays, calculateTHI(28, 70));
@@ -737,6 +970,8 @@ app.post('/api/dwp/order', auth, requireManager, async (req, res) => {
 // ============================================================
 app.get('/api/feed/inventory/:floorId', auth, async (req, res) => {
     try {
+        const owns = await verifyFloorOwnership(req.params.floorId, req.user.farm_id);
+        if (!owns) return res.status(403).json({ error: 'Lantai tidak ditemukan atau bukan milik client ini' });
         const result = await pool.query('SELECT * FROM feed_inventory WHERE floor_id = $1', [req.params.floorId]);
         res.json(result.rows[0] || { floor_id: req.params.floorId, current_stock_kg: 0 });
     } catch (err) {
@@ -750,6 +985,8 @@ app.post('/api/feed/receipt', auth, requireManager, async (req, res) => {
     try {
         const { floorId, quantityKg, feedType, supplier } = req.body;
         if (!floorId || !quantityKg || quantityKg <= 0) return res.status(400).json({ error: 'Data tidak valid' });
+        const owns = await verifyFloorOwnership(floorId, req.user.farm_id);
+        if (!owns) { client.release(); return res.status(403).json({ error: 'Lantai tidak ditemukan atau bukan milik client ini' }); }
 
         await client.query('BEGIN');
         const receipt = await client.query(`
@@ -781,9 +1018,21 @@ app.post('/api/feed/transfer', auth, requireManager, async (req, res) => {
     try {
         const { fromFloorId, toFloorId, quantityKg, reason } = req.body;
         if (!fromFloorId || !toFloorId || !quantityKg || quantityKg <= 0) {
+            client.release();
             return res.status(400).json({ error: 'Data tidak valid' });
         }
-        if (fromFloorId === toFloorId) return res.status(400).json({ error: 'Tidak bisa transfer ke lantai yang sama' });
+        if (fromFloorId === toFloorId) { client.release(); return res.status(400).json({ error: 'Tidak bisa transfer ke lantai yang sama' }); }
+
+        // KEDUA floor wajib milik farm yang sama dengan pemanggil — mencegah
+        // transfer pakan lintas-client (curi stok Client B ke Client A).
+        const [ownsFrom, ownsTo] = await Promise.all([
+            verifyFloorOwnership(fromFloorId, req.user.farm_id),
+            verifyFloorOwnership(toFloorId, req.user.farm_id)
+        ]);
+        if (!ownsFrom || !ownsTo) {
+            client.release();
+            return res.status(403).json({ error: 'Salah satu lantai tidak ditemukan atau bukan milik client ini' });
+        }
 
         await client.query('BEGIN');
 
@@ -825,7 +1074,7 @@ app.post('/api/feed/transfer', auth, requireManager, async (req, res) => {
 app.get('/api/users', auth, requireManager, async (req, res) => {
     try {
         const result = await pool.query(
-            'SELECT id, name, role, barn_id, floor_id, active, last_login_at FROM users WHERE farm_id = $1 AND active = true ORDER BY name',
+            'SELECT id, name, role, barn_id, floor_id, email, phone_number, active, last_login_at FROM users WHERE farm_id = $1 AND active = true ORDER BY name',
             [req.user.farm_id]
         );
         res.json(result.rows.map(u => ({ ...u, role: capRole(u.role) })));
@@ -837,19 +1086,28 @@ app.get('/api/users', auth, requireManager, async (req, res) => {
 
 app.post('/api/users', auth, requireManager, async (req, res) => {
     try {
-        const { name, pin, role, barnId, floorId } = req.body;
+        const { name, pin, role, barnId, floorId, email, phoneNumber } = req.body;
         if (!name || !pin || !role) return res.status(400).json({ error: 'Nama, PIN, dan role wajib diisi' });
         if (!pin.match(/^[0-9]{4,6}$/)) return res.status(400).json({ error: 'PIN harus 4-6 digit angka' });
+        if (email && !email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+            return res.status(400).json({ error: 'Format email tidak valid' });
+        }
+        if (phoneNumber && !phoneNumber.match(/^(\+62|62|0)8[0-9]{7,12}$/)) {
+            return res.status(400).json({ error: 'Format nomor telepon tidak valid (contoh: 081234567890)' });
+        }
 
         const hash = await bcrypt.hash(pin, 10);
         const result = await pool.query(`
-            INSERT INTO users (name, pin_hash, role, farm_id, barn_id, floor_id)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, name, role, barn_id, floor_id
-        `, [name, hash, role.toLowerCase(), req.user.farm_id, barnId || null, floorId || null]);
+            INSERT INTO users (name, pin_hash, role, farm_id, barn_id, floor_id, email, phone_number)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id, name, role, barn_id, floor_id, email, phone_number
+        `, [name, hash, role.toLowerCase(), req.user.farm_id, barnId || null, floorId || null, email || null, phoneNumber || null]);
 
         res.status(201).json({ ...result.rows[0], role: capRole(result.rows[0].role) });
     } catch (err) {
+        if (err.code === '23505') { // unique_violation (email sudah dipakai)
+            return res.status(409).json({ error: 'Email sudah terdaftar untuk user lain' });
+        }
         console.error('user create error:', err);
         res.status(500).json({ error: 'Gagal membuat user', detail: err.message });
     }
