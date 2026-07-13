@@ -74,7 +74,7 @@ const allowedOrigins = [
     'https://broileros.pages.dev',
     'http://localhost:5173',
     'http://localhost:3000',
-    'https://broileros.onrender.com'
+    'https://broileros-app.onrender.com'
 ];
 app.use(cors({
     origin: function (origin, callback) {
@@ -400,7 +400,7 @@ app.get('/api/users/public', async (req, res) => {
 
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
     try {
-        const { userId, pin, farmId } = req.body;
+        const { userId, pin, farmId, superAdminKey } = req.body;
         if (!userId || !pin) return res.status(400).json({ error: 'User ID dan PIN wajib' });
         if (!farmId) return res.status(400).json({ error: 'Sesi client tidak valid, muat ulang halaman login' });
         if (!userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
@@ -421,6 +421,30 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
 
         const valid = await bcrypt.compare(pin, user.pin_hash);
         if (!valid) return res.status(401).json({ error: 'PIN salah' });
+
+        // ============================================================
+        // BARRIER TAMBAHAN KHUSUS SUPER ADMIN
+        // ============================================================
+        // Akun is_super_admin=true punya blast radius jauh lebih besar
+        // dari Manager biasa (akses lintas-Client), jadi PIN 4-6 digit
+        // saja tidak cukup. Wajibkan kunci rahasia KEDUA (SUPER_ADMIN_KEY
+        // di env var Render, terpisah total dari JWT_SECRET & PIN) yang
+        // hanya diperiksa untuk akun ini — sama sekali tidak berlaku/tidak
+        // berpengaruh untuk login Manager/Supervisor/Operator biasa.
+        if (user.is_super_admin) {
+            const expectedKey = process.env.SUPER_ADMIN_KEY;
+            if (!expectedKey) {
+                // Fail-safe: kalau env var belum diset, TOLAK login super
+                // admin sama sekali daripada diam-diam tanpa proteksi.
+                console.error('SUPER_ADMIN_KEY belum diset di environment — login super admin diblokir demi keamanan.');
+                return res.status(503).json({ error: 'Login Super Admin belum dikonfigurasi server. Hubungi developer.' });
+            }
+            if (!superAdminKey || superAdminKey !== expectedKey) {
+                console.warn(`Percobaan login Super Admin GAGAL (kunci salah/kosong) - user=${user.name} ip=${req.ip} waktu=${new Date().toISOString()}`);
+                return res.status(401).json({ error: 'Kunci Super Admin tidak valid' });
+            }
+            console.warn(`Login Super Admin BERHASIL - user=${user.name} ip=${req.ip} waktu=${new Date().toISOString()}`);
+        }
 
         const farm = await pool.query('SELECT name FROM farms WHERE id = $1', [user.farm_id]);
         const token = jwt.sign({ id: user.id, role: user.role, farm_id: user.farm_id }, JWT_SECRET, { expiresIn: '7d' });
@@ -1135,6 +1159,16 @@ app.delete('/api/users/:id', auth, requireManager, async (req, res) => {
 // ============================================================
 app.use((req, res) => res.status(404).json({ error: 'Endpoint tidak ditemukan' }));
 app.use((err, req, res, next) => {
+    // body-parser (dipakai express.json()) sudah menandai body JSON yang
+    // tidak valid dengan err.type='entity.parse.failed' & err.status=400 —
+    // ini kesalahan KLIEN (biasanya bot/scanner otomatis yang mengetuk
+    // endpoint publik dengan payload acak), BUKAN bug di server. Dibalas
+    // 400 (bukan 500) dan dicatat terpisah supaya tidak mencemari log
+    // sebagai "Unhandled error" yang bikin bug asli susah ditemukan.
+    if (err.type === 'entity.parse.failed') {
+        console.warn(`Bad request (JSON tidak valid) dari ${req.ip} - ${req.method} ${req.originalUrl}`);
+        return res.status(400).json({ error: 'Format JSON pada request tidak valid' });
+    }
     console.error('Unhandled error:', err);
     res.status(500).json({ error: 'Terjadi kesalahan internal server' });
 });
